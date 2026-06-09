@@ -1,0 +1,41 @@
+{
+  "name": "@hermes/ui-tui-opentui-v2",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Native OpenTUI engine for Hermes (Solid + Effect-at-boundary, from scratch). Ink (ui-tui/) stays the shipping default.",
+  "scripts": {
+    "type-check": "tsc --noEmit",
+    "lint": "eslint .",
+    "lint:fix": "eslint . --fix",
+    "fmt": "prettier --write src",
+    "fix": "prettier --write src && eslint . --fix",
+    "build": "node scripts/build.mjs",
+    "start": "node --experimental-ffi --no-warnings dist/main.js",
+    "test": "vitest run",
+    "check": "bash scripts/check.sh",
+    "dev": "node scripts/build.mjs && node --experimental-ffi --no-warnings dist/main.js"
+  },
+  "dependencies": {
+    "@opentui/core": "0.4.0",
+    "@opentui/keymap": "0.4.0",
+    "@opentui/solid": "0.4.0",
+    "effect": "4.0.0-beta.78",
+    "solid-js": "1.9.12"
+  },
+  "devDependencies": {
+    "@babel/core": "^7.29.7",
+    "@babel/preset-typescript": "^7.29.7",
+    "@effect/vitest": "^4.0.0-beta.78",
+    "@eslint/js": "^9",
+    "@types/node": "^24",
+    "babel-preset-solid": "^1.9.12",
+    "esbuild": "^0.28.0",
+    "eslint": "^9",
+    "eslint-plugin-unused-imports": "^4",
+    "prettier": "^3",
+    "typescript": "^5",
+    "typescript-eslint": "^8",
+    "vitest": "^4.1.8"
+  }
+}
