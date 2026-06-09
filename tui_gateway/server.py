@@ -2931,7 +2931,13 @@ def _coerce_message_text(content: Any) -> str:
     return str(content)
 
 
-def _history_to_messages(history: list[dict]) -> list[dict]:
+def _history_to_messages(history: list[dict], include_tool_output: bool = False) -> list[dict]:
+    # ``include_tool_output`` (opt-in; only the native/opentui engine passes it via
+    # session.resume) folds each tool's redacted+capped result + args into its row so
+    # a resumed transcript renders collapsible tool blocks identical to a live turn.
+    # OFF by default so the Ink path is byte-for-byte unchanged (its render tree showed
+    # the verbose trail expanded and OOM'd on big output — #34095; the native engine
+    # renders tools collapsed, so shipping the same capped tail is safe there).
     messages = []
     tool_call_args = {}
 
@@ -2959,9 +2965,13 @@ def _history_to_messages(history: list[dict]) -> list[dict]:
             tc_info = tool_call_args.get(tc_id) if tc_id else None
             name = (tc_info[0] if tc_info else None) or m.get("tool_name") or "tool"
             args = (tc_info[1] if tc_info else None) or {}
-            messages.append(
-                {"role": "tool", "name": name, "context": _tool_ctx(name, args)}
-            )
+            tool_msg = {"role": "tool", "name": name, "context": _tool_ctx(name, args)}
+            if include_tool_output:
+                if args:
+                    tool_msg["args"] = args
+                if content_text.strip():
+                    tool_msg["result_text"] = _redact_tui_verbose_text(content_text)
+            messages.append(tool_msg)
             continue
         if not content_text.strip():
             continue
@@ -3338,7 +3348,9 @@ def _(rid, params: dict) -> dict:
         display_history_prefix = display_history[
             : max(0, len(display_history) - len(history))
         ]
-        messages = _history_to_messages(display_history)
+        messages = _history_to_messages(
+            display_history, include_tool_output=bool(params.get("with_tool_output"))
+        )
         tokens = _set_session_context(target)
         try:
             # Pass the profile's db so the agent persists turns to the right
@@ -8504,6 +8516,67 @@ def _(rid, params: dict) -> dict:
         return _ok(rid, {"toolsets": items})
     except Exception as e:
         return _err(rid, 5031, str(e))
+
+
+@method("startup.catalog")
+def _(rid, params: dict) -> dict:
+    # Aggregate tools / skills / MCP servers for the native engine's startup panel
+    # (item 9). Opt-in RPC — only the opentui home screen calls it, so the Ink path
+    # is untouched. Each section is best-effort: a failing source yields an empty
+    # section rather than erroring the whole call.
+    tools: dict = {"total": 0, "toolsets": []}
+    try:
+        from toolsets import get_all_toolsets, get_toolset_info
+
+        # enabled toolsets for THIS session (or the config default), mirroring tools.list
+        session = _sessions.get(params.get("session_id", ""))
+        enabled = (
+            set(getattr(session["agent"], "enabled_toolsets", []) or [])
+            if session
+            else set(_load_enabled_toolsets() or [])
+        )
+        for name in sorted(get_all_toolsets().keys()):
+            info = get_toolset_info(name)
+            if not info:
+                continue
+            is_on = name in enabled if enabled else True
+            # the startup panel lists ENABLED toolsets with their tools (Ink parity)
+            tool_names = [str(t) for t in (info.get("resolved_tools") or [])]
+            tools["toolsets"].append(
+                {"name": name, "count": int(info["tool_count"]), "enabled": is_on, "tools": tool_names}
+            )
+            if is_on:
+                tools["total"] += int(info["tool_count"])
+    except Exception:
+        pass
+
+    skills: dict = {"total": 0, "categories": []}
+    try:
+        from hermes_cli.banner import get_available_skills
+
+        by_cat = get_available_skills() or {}
+        for cat in sorted(by_cat.keys()):
+            names = by_cat[cat] or []
+            skills["categories"].append({"name": cat, "count": len(names)})
+            skills["total"] += len(names)
+    except Exception:
+        pass
+
+    mcp_servers: list = []
+    try:
+        from hermes_cli.config import read_raw_config
+        from hermes_cli.tools_config import _parse_enabled_flag
+
+        raw_cfg = read_raw_config() or {}
+        servers = raw_cfg.get("mcp_servers")
+        if isinstance(servers, dict):
+            for name, cfg in servers.items():
+                if isinstance(cfg, dict) and _parse_enabled_flag(cfg.get("enabled", True), default=True):
+                    mcp_servers.append(str(name))
+    except Exception:
+        pass
+
+    return _ok(rid, {"tools": tools, "skills": skills, "mcp": {"servers": sorted(mcp_servers)}})
 
 
 @method("tools.show")

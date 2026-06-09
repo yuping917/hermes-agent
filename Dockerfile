@@ -1,12 +1,14 @@
 FROM ghcr.io/astral-sh/uv:0.11.6-python3.13-trixie@sha256:b3c543b6c4f23a5f2df22866bd7857e5d304b67a564f4feab6ac22044dde719b AS uv_source
-# Node 22 LTS source stage. Debian trixie's bundled nodejs is pinned to 20.x
-# which reached EOL in April 2026 — we copy node + npm + corepack from the
-# upstream node:22 image instead so we can stay on a supported LTS without
-# waiting for Debian 14 (forky, ~mid-2027).  Bookworm-based slim image used
-# so the produced binary links against glibc 2.36, which runs cleanly on
-# our Debian 13 (trixie, glibc 2.41) runtime.  Bumping to a new Node major
-# is a one-line ARG change; see #4977.
-FROM node:22-bookworm-slim@sha256:7af03b14a13c8cdd38e45058fd957bf00a72bbe17feac43b1c15a689c029c732 AS node_source
+# Node 26 source stage. Debian trixie's bundled nodejs is pinned to 20.x
+# (EOL April 2026), so we copy node + npm + corepack from the upstream node:26
+# image instead.  Node 26 (Current; LTS promotion ~Oct 2026) is REQUIRED by the
+# native OpenTUI TUI engine, which loads its renderer via the experimental
+# `node:ffi` API that only exists on Node 26.3+ (the Ink engine + web build run
+# on it too).  Bookworm-based slim image used so the produced binary links
+# against glibc 2.36, which runs cleanly on our Debian 13 (trixie, glibc 2.41)
+# runtime.  The pinned tag ships v26.3.0.  Bumping Node is a one-line change here.
+# NOTE: verify the full image build + Ink/web/Playwright on Node 26 in CI.
+FROM node:26-bookworm-slim@sha256:79723b41edbedf595f62e943a9f8b0ba9af5b1e61045c5f8f59c2c02c1212a16 AS node_source
 FROM debian:13.4
 
 # Disable Python stdout buffering to ensure logs are printed immediately
@@ -90,7 +92,7 @@ RUN useradd -u 10000 -m -d /opt/data hermes
 
 COPY --chmod=0755 --from=uv_source /usr/local/bin/uv /usr/local/bin/uvx /usr/local/bin/
 
-# Node 22 LTS: copy the node binary plus the bundled npm + corepack JS
+# Node 26: copy the node binary plus the bundled npm + corepack JS
 # installs from the upstream image.  npm and npx are recreated as symlinks
 # because they're symlinks in the source image (and need to live on PATH).
 # See node_source stage at the top of the file for the version-bump
@@ -119,7 +121,7 @@ COPY ui-tui/packages/hermes-ink/ ui-tui/packages/hermes-ink/
 
 # `npm_config_install_links=false` forces npm to install `file:` deps as
 # symlinks instead of copies.  This is the default since npm 10+, which is
-# what the image ships now (via the node:22 source stage).  We set it
+# what the image ships now (via the node:26 source stage).  We set it
 # explicitly anyway as defense-in-depth: the previous Debian-bundled npm
 # 9.x defaulted to install-as-copy, which produced a hidden
 # node_modules/.package-lock.json that permanently disagreed with the root
@@ -174,8 +176,15 @@ RUN uv sync --frozen --no-install-project --extra all --extra messaging --extra 
 COPY --chown=hermes:hermes . .
 
 # Build browser dashboard and terminal UI assets.
+# ui-tui-opentui-v2 is the opt-in native OpenTUI engine (HERMES_TUI_ENGINE=opentui;
+# default stays Ink). .dockerignore strips its node_modules/dist, so install +
+# esbuild-build it here → dist/main.js, then prune devDeps (esbuild/babel/vitest);
+# the runtime only needs the prod deps (the external @opentui/core + its native
+# blob — the bundle inlines solid/effect). Build needs Node 26.3 (node:ffi floor),
+# which this image now ships. (CI must verify the full image build on Node 26.)
 RUN cd web && npm run build && \
-    cd ../ui-tui && npm run build
+    cd ../ui-tui && npm run build && \
+    cd ../ui-tui-opentui-v2 && npm install --no-audit --no-fund && npm run build && npm prune --omit=dev
 
 # ---------- Permissions ----------
 # Make install dir world-readable so any HERMES_UID can read it at runtime.

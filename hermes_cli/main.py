@@ -1527,8 +1527,229 @@ def _find_bundled_tui(hermes_cli_dir: Path | None = None) -> Path | None:
     return bundled if bundled.is_file() else None
 
 
+def _config_tui_engine_early() -> str | None:
+    """Read ``display.tui_engine`` from config via a minimal YAML read.
+
+    Returns the configured engine string, or ``None`` when unset/unreadable so the
+    caller can apply the availability-gated default. Mirrors
+    :func:`_config_default_interface_early`.
+    """
+    try:
+        home = os.environ.get("HERMES_HOME")
+        cfg_path = (
+            os.path.join(home, "config.yaml")
+            if home
+            else os.path.join(os.path.expanduser("~"), ".hermes", "config.yaml")
+        )
+        if os.path.exists(cfg_path):
+            import yaml as _yaml_eng
+
+            with open(cfg_path, encoding="utf-8") as _f:
+                raw = _yaml_eng.safe_load(_f) or {}
+            disp = raw.get("display", {})
+            if isinstance(disp, dict):
+                eng = disp.get("tui_engine")
+                if isinstance(eng, str) and eng.strip():
+                    return eng.strip().lower()
+    except Exception:
+        pass
+    return None
+
+
+def _resolve_tui_engine() -> str:
+    """Which TUI engine to launch: "ink" (default) or "opentui".
+
+    Precedence: ``HERMES_TUI_ENGINE`` env > ``display.tui_engine`` config >
+    (OpenTUI when this host can run it — Node >= 26.3 + the built package — else Ink).
+    The OpenTUI engine runs on Node 26.3+ via the experimental ``node:ffi`` renderer,
+    which is not validated on Windows or Termux — a request for "opentui" there falls
+    back to "ink" with a notice so a stale flag never strands the user on an engine
+    that can't start.
+    """
+    env = (os.environ.get("HERMES_TUI_ENGINE") or "").strip().lower()
+    # Explicit choice (env > config) wins; otherwise default to OpenTUI when this
+    # host is genuinely set up for it (Node >= 26.3 + the built bundle), else Ink.
+    engine = env or _config_tui_engine_early() or ("opentui" if _opentui_available() else "ink")
+    if engine != "opentui":
+        return "ink"
+
+    # opentui requested — gate on platform support.
+    unsupported = sys.platform.startswith("win") or _is_termux_startup_environment()
+    if unsupported:
+        if not os.environ.get("HERMES_QUIET"):
+            where = "Windows" if sys.platform.startswith("win") else "Termux"
+            print(
+                f"HERMES_TUI_ENGINE=opentui is not supported on {where} "
+                f"(needs Node 26.3+ with experimental FFI) — falling back to the Ink engine.",
+                file=sys.stderr,
+            )
+        return "ink"
+    return "opentui"
+
+
+NODE26_MIN_VERSION = (26, 3, 0)
+
+
+def _node_version_tuple(node_bin: str) -> tuple[int, int, int] | None:
+    """Return (major, minor, patch) for a node binary, or ``None`` if unreadable."""
+    try:
+        out = subprocess.run([node_bin, "--version"], capture_output=True, text=True, timeout=5)
+    except Exception:
+        return None
+    if out.returncode != 0:
+        return None
+    raw = (out.stdout or "").strip().lstrip("v").split("-", 1)[0]
+    parts = raw.split(".")
+    try:
+        return (int(parts[0]), int(parts[1]), int(parts[2]))
+    except (IndexError, ValueError):
+        return None
+
+
+def _node26_bin_or_none() -> str | None:
+    """Resolve a Node >= 26.3.0 binary (no exit — a probe), or ``None``.
+
+    ``HERMES_NODE`` override > ``node`` on PATH, each gated on version >= 26.3.0.
+    OpenTUI's native renderer loads via the experimental ``node:ffi`` API that only
+    exists on Node 26.3+, so an older Node is treated as "not available".
+    """
+    candidates: list[str] = []
+    env_node = os.environ.get("HERMES_NODE")
+    if env_node and os.path.isfile(env_node) and os.access(env_node, os.X_OK):
+        candidates.append(env_node)
+    path = shutil.which("node")
+    if path:
+        candidates.append(path)
+    for cand in candidates:
+        ver = _node_version_tuple(cand)
+        if ver is not None and ver >= NODE26_MIN_VERSION:
+            return cand
+    return None
+
+
+def _node26_bin() -> str:
+    """Resolve Node >= 26.3.0 for the OpenTUI engine, or exit with a clear message.
+
+    Use :func:`_node26_bin_or_none` for a non-fatal availability probe.
+    """
+    node = _node26_bin_or_none()
+    if node is not None:
+        return node
+    print(
+        "Node.js >= 26.3.0 not found — the OpenTUI TUI engine needs it for the "
+        "experimental node:ffi renderer.\n"
+        "Install Node 26.3+ (e.g. via fnm/nvm) or set HERMES_NODE=/path/to/node, "
+        "or unset HERMES_TUI_ENGINE to use the default Ink engine.",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
+
+def _opentui_npm() -> str:
+    """Resolve npm (ships with Node) to build the OpenTUI bundle, or exit."""
+    npm = shutil.which("npm")
+    if npm:
+        return npm
+    print(
+        "npm not found — needed to build the OpenTUI engine bundle.\n"
+        "Install Node 26.3+ (it ships npm), or unset HERMES_TUI_ENGINE for Ink.",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
+
+def _opentui_available() -> bool:
+    """Whether the OpenTUI engine can actually launch on this host.
+
+    True only when the platform is supported (not Windows/Termux), a Node >= 26.3
+    binary resolves (the node:ffi floor), AND the v2 package is BUILT
+    (``dist/main.js``) with its ``node_modules`` installed. This gates the DEFAULT
+    engine: a host genuinely set up for OpenTUI defaults to it; everyone else stays
+    on Ink. An explicit ``HERMES_TUI_ENGINE`` env or ``display.tui_engine`` config
+    choice bypasses this probe (and triggers an on-demand build).
+    """
+    if sys.platform.startswith("win") or _is_termux_startup_environment():
+        return False
+    if _node26_bin_or_none() is None:
+        return False
+    pkg = PROJECT_ROOT / "ui-tui-opentui-v2"
+    built = pkg / "dist" / "main.js"
+    return built.is_file() and (pkg / "node_modules" / "@opentui").is_dir()
+
+
+def _make_opentui_argv(tui_dev: bool) -> tuple[list[str], Path]:
+    """Argv for the native OpenTUI engine under Node 26 (no Bun).
+
+    Builds the Solid + Effect-at-boundary engine (``ui-tui-opentui-v2``) with esbuild
+    (``npm run build`` → ``dist/main.js``) when the bundle is missing (or always, in
+    ``--dev``), then launches it on Node with the experimental FFI flag:
+
+        node --experimental-ffi --no-warnings dist/main.js
+
+    ``--no-warnings`` keeps the ExperimentalWarning off the TUI's stderr. Returns the
+    argv and the package cwd.
+
+    The spawned ``tui_gateway`` resolves its Python from ``HERMES_PYTHON_SRC_ROOT``
+    (the caller sets it to ``PROJECT_ROOT``); the built bundle's own fallback also
+    walks up to the checkout root, so the gateway resolves correctly either way.
+    """
+    app_dir = PROJECT_ROOT / "ui-tui-opentui-v2"
+    entry_src = app_dir / "src" / "entry" / "main.tsx"
+    if not entry_src.is_file():
+        print(
+            f"OpenTUI v2 engine entry not found at {entry_src}.\n"
+            f"Unset HERMES_TUI_ENGINE to use the default Ink engine.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    node = _node26_bin()
+
+    # The esbuild build needs the package's node_modules (esbuild + the @opentui
+    # packages + the native blob). Without them the build/launch dies cryptically.
+    if not (app_dir / "node_modules" / "@opentui").is_dir():
+        print(
+            f"OpenTUI engine dependencies are not installed in {app_dir}.\n"
+            f"Run:  (cd {app_dir} && npm install)\n"
+            f"Or unset HERMES_TUI_ENGINE to use the default Ink engine.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    built = app_dir / "dist" / "main.js"
+    if tui_dev or not built.is_file():
+        npm = _opentui_npm()
+        if not os.environ.get("HERMES_QUIET"):
+            print("Building the OpenTUI engine…", file=sys.stderr)
+        result = subprocess.run(
+            [npm, "run", "build"],
+            cwd=str(app_dir),
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            combined = f"{result.stdout or ''}{result.stderr or ''}".strip()
+            preview = "\n".join(combined.splitlines()[-30:])
+            print("OpenTUI engine build failed.", file=sys.stderr)
+            if preview:
+                print(preview, file=sys.stderr)
+            sys.exit(1)
+
+    return [node, "--experimental-ffi", "--no-warnings", str(built)], app_dir
+
+
 def _make_tui_argv(tui_dir: Path, tui_dev: bool) -> tuple[list[str], Path]:
-    """TUI: --dev → tsx src; else node dist (HERMES_TUI_DIR prebuilt or esbuild)."""
+    """TUI: --dev → tsx src; else node dist (HERMES_TUI_DIR prebuilt or esbuild).
+
+    Dual-engine: when ``HERMES_TUI_ENGINE``/``display.tui_engine`` selects the
+    native OpenTUI engine, dispatch to ``_make_opentui_argv`` (Node 26 + its own
+    esbuild build) BEFORE the Ink Node bootstrap — the OpenTUI engine resolves its
+    own Node >= 26.3 and builds its own bundle, so it must not be routed through
+    ``_ensure_tui_node`` / the Ink prebuilt-dir logic.
+    """
+    if _resolve_tui_engine() == "opentui":
+        return _make_opentui_argv(tui_dev)
+
     _ensure_tui_node()
 
     def _node_bin(bin: str) -> str:
@@ -1887,6 +2108,11 @@ def _launch_tui(
     # --expose-gc is *not* added here: Node rejects it in NODE_OPTIONS
     # ("--expose-gc is not allowed in NODE_OPTIONS") and refuses to start.
     # It is passed as a direct argv flag in _make_tui_argv() instead.
+    #
+    # Both TUI engines run on Node/V8 now — Ink, and the native OpenTUI engine
+    # (Node 26 + node:ffi). So --max-old-space-size (a V8/Node flag) applies to
+    # both. (Pre-Node-26 the OpenTUI engine ran on Bun/JavaScriptCore, which has
+    # no such flag; that gate is gone now that the engine is Node.)
     _tokens = env.get("NODE_OPTIONS", "").split()
     if not any(t.startswith("--max-old-space-size=") for t in _tokens):
         _tokens.append(f"--max-old-space-size={_resolve_tui_heap_mb()}")
