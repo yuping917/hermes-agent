@@ -180,6 +180,7 @@ class TestInboundMedia:
         ad = LineAdapter(cfg)
         ad._client = MagicMock()
         ad._client.fetch_content = AsyncMock(return_value=b"line-bytes")
+        ad._client.loading = AsyncMock()
         ad.handle_message = AsyncMock()
         return ad
 
@@ -189,7 +190,7 @@ class TestInboundMedia:
         return {
             "type": "message",
             "replyToken": "reply-token",
-            "source": {"type": "group", "groupId": "Cline", "userId": "Uline"},
+            "source": {"type": "user", "userId": "Uline"},
             "message": payload,
         }
 
