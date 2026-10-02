@@ -537,6 +537,19 @@ class LineAdapter(BasePlatformAdapter):
         source = event.get("source") or {}
         chat_id, chat_type = _resolve_chat(source)
         user_id = source.get("userId", "") or chat_id
+        # Unrelated group traffic must not replace an in-flight request's token.
+        if (source.get("type") or "").lower() in {"group", "room"}:
+            if msg_type != "text":
+                return
+            text_for_gate = (msg.get("text") or "").strip()
+            has_prefix_mention = bool(re.match(
+                r"^[＠@]\s*hermes\b", text_for_gate, flags=re.IGNORECASE))
+            mentionees = (msg.get("mention") or {}).get("mentionees") or []
+            has_true_mention = any(
+                isinstance(m, dict) and (m.get("isSelf") is True or m.get("type") == "all")
+                for m in mentionees)
+            if not (has_prefix_mention or has_true_mention):
+                return
         if chat_id and reply_token:  # stash the reply token for outbound use
             self._reply_tokens[chat_id] = (reply_token, time.time() + LINE_REPLY_TOKEN_TTL_SECONDS)
         media_urls: List[str] = []
@@ -651,6 +664,13 @@ class LineAdapter(BasePlatformAdapter):
             entry = self._cache.get(pending_rid)
             if entry is not None and entry.state is State.PENDING:
                 self._cache.set_ready(pending_rid, content)
+                # The threshold button already used the reply token. Try push now;
+                # if it fails, leave READY + mapping for the button's fallback.
+                pushed = await self._send_text_chunks(chat_id, content, force_push=True)
+                if pushed.success:
+                    self._cache.mark_delivered(pending_rid)
+                    if self._pending_buttons.get(chat_id) == pending_rid:
+                        self._pending_buttons.pop(chat_id, None)
                 return SendResult(success=True, message_id=pending_rid)
             # Stale mapping: the entry is READY/DELIVERED/ERROR or gone entirely —
             # absorbing this send would silently swallow the answer behind a dead
