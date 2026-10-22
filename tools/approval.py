@@ -26,7 +26,7 @@ from tools.approval_context import (
     _get_session_platform, _is_cron_approval_context,
     _is_gateway_approval_context, _is_interactive_cli, _is_single_query_approval_context,
     _is_unattended_platform_approval_context, _resolve_cli_approval_callback, _should_fall_through_to_cli_approval,
-    get_current_session_key,
+    _tirith_fail_open, get_current_session_key,
 )
 from tools.approval_detection import (
     _approval_key_aliases, _check_sudo_stdin_guard, detect_dangerous_command, detect_hardline_command,
@@ -391,7 +391,7 @@ def _persist_choice(session_key: str, choice: str, keys: list[str]) -> None:
         if choice not in ("session", "always"):
             continue
         approve_session(session_key, key)
-        if choice == "always":
+        if choice == "always" and not key.startswith("tirith:"):
             approve_permanent(key)
             with _lock:
                 snapshot = set(_permanent_set())
@@ -558,6 +558,8 @@ def _pending_result(spec, session_key: str, *, command: str, description: str,
     if spec.pending_keys:
         pending["pattern_keys"] = pattern_keys
     pending["description"] = description
+    if pattern_keys and all(key.startswith("tirith:") for key in pattern_keys):
+        pending["allow_permanent"] = False
     if smart_denied:
         pending.update(smart_denied=True, allow_permanent=False)
     submit_pending(session_key, pending)
@@ -579,6 +581,8 @@ def _pending_result(spec, session_key: str, *, command: str, description: str,
             "user's decision; if this turn must end, report that approval is pending."
         ),
     }
+    if pattern_keys and all(key.startswith("tirith:") for key in pattern_keys):
+        result["allow_permanent"] = False
     if smart_denied:
         result.update(smart_denied=True, allow_permanent=False)
     return result
@@ -640,7 +644,13 @@ def _unattended_contexts() -> list[_Unattended]:
 
 
 def _unattended_deny(command: str, ctx: _Unattended) -> dict | None:
-    """Deny-mode handling for one unattended context (cron / -q / webhook); None = allow."""
+    """Deny-mode handling for one unattended context (cron / -q / webhook); None = allow.
+
+    Pattern detection first, then tirith so content-level threats (homograph URLs,
+    pipe-to-interpreter, terminal injection) are caught even when the pattern detector misses.
+    An un-importable tirith honours ``security.tirith_fail_open``: fail-closed means block,
+    since nobody can approve.
+    """
     if ctx.mode() != "deny":
         return None
 
@@ -655,6 +665,18 @@ def _unattended_deny(command: str, ctx: _Unattended) -> dict | None:
         if ctx.name == "single_query":
             result.update(pattern_key=pattern_key, description=description)
         return result
+    try:
+        from tools.tirith_security import check_command_security
+        tirith = check_command_security(command)
+    except ImportError:
+        if _tirith_fail_open():
+            return None
+        return {"approved": False, "message": (
+            "BLOCKED: the Tirith security scanner could not be imported and security.tirith_fail_open is false, "
+            f"so this command cannot be silently allowed — and {ctx.clause}. "
+            f"Find an alternative approach, install tirith, or set approvals.{ctx.cfg_key}: approve in config.yaml.")}
+    if tirith.get("action") in ("block", "warn"):
+        return block(_format_tirith_description(tirith))
     return None
 
 
@@ -780,7 +802,8 @@ def _smart_gate(spec: _GateSpec, command: str, description: str, pattern_key: st
 def _human_decision(spec: _GateSpec, *, command: str, description: str,
                     pattern_key: str, pattern_keys: list[str],
                     session_key: str, approval_callback, is_cli: bool, is_gateway: bool,
-                    is_ask: bool, smart: bool = False, pending_body=None) -> dict:
+                    is_ask: bool, smart: bool = False, pending_body=None,
+                    permanent_capable: bool = True) -> dict:
     """Ask a human (after the optional guardian-LLM step) and turn the answer into the gate result.
 
     ``pattern_keys`` are what :func:`_persist_choice` stores on session/always; a smart-DENY
@@ -796,7 +819,7 @@ def _human_decision(spec: _GateSpec, *, command: str, description: str,
         if result is not None:
             return result
     pending_body = pending_body() if pending_body else None
-    allow_permanent = not smart_denied
+    allow_permanent = permanent_capable and not smart_denied
 
     def deny(template: str, outcome: str, **fmt) -> dict:
         breaker = ""
@@ -845,7 +868,7 @@ def _human_decision(spec: _GateSpec, *, command: str, description: str,
             data = {
                 "command": display_command, "pattern_key": pattern_key,
                 "pattern_keys": pattern_keys, "description": display_description,
-                "allow_permanent": not smart_denied,
+                "allow_permanent": allow_permanent,
                 "allow_session": not smart_denied,
             }
             if smart_denied:
@@ -1132,6 +1155,40 @@ def request_tool_approval(tool_name: str, reason: str, *, rule_key: str = "", ap
 
 # --- Combined pre-exec guard (floors + dangerous command detection) ------------------------------------------------
 
+def _format_tirith_description(tirith_result: dict) -> str:
+    """Human-readable severity/title/description summary of tirith findings."""
+    parts = []
+    for f in tirith_result.get("findings") or []:
+        severity, title, desc = f.get("severity", ""), f.get("title", ""), f.get("description", "")
+        if title:
+            text = f"{title}: {desc}" if desc else title
+            parts.append(f"[{severity}] {text}" if severity else text)
+    if not parts:
+        summary = tirith_result.get("summary") or "security issue detected"
+        return f"Security scan: {summary}"
+    return "Security scan — " + "; ".join(parts)
+
+
+def _tirith_scan(command: str) -> dict:
+    """Tirith result for the interactive flow; an un-importable scanner allows
+    (default) or, under fail-closed, synthesizes a HIGH warn finding that goes
+    through the normal approval flow (#20733)."""
+    try:
+        from tools.tirith_security import check_command_security
+        return check_command_security(command)
+    except ImportError:
+        if _tirith_fail_open():
+            return {"action": "allow", "findings": [], "summary": ""}
+        return {"action": "warn", "summary": "Tirith unavailable (fail-closed)", "findings": [{
+            "rule_id": "tirith-import-error", "severity": "HIGH",
+            "title": "Tirith security module unavailable",
+            "description": ("The Tirith security scanner could not be imported. "
+                            "Because security.tirith_fail_open is false, this "
+                            "command cannot be silently allowed. Approve only if "
+                            "you have verified the command is safe."),
+        }]}
+
+
 def check_all_command_guards(command: str, env_type: str,
                              approval_callback=None,
                              has_host_access: bool = False) -> dict:
@@ -1166,15 +1223,36 @@ def check_all_command_guards(command: str, env_type: str,
                 return result
         return _approved()
 
+    # Gather findings: warnings = [(pattern_key, description, is_tirith)]. Tirith block AND warn both go through the
+    # approval flow (block used to be a hard stop) so users can inspect the findings and approve.
+    tirith_result = _tirith_scan(command)
     is_dangerous, pattern_key, description = detect_dangerous_command(command)
+    warnings = []
     session_key = get_current_session_key()
-    if not is_dangerous or is_approved(session_key, pattern_key):
+    if tirith_result["action"] in {"block", "warn"}:
+        findings = tirith_result.get("findings") or []
+        rule_id = findings[0].get("rule_id", "unknown") if findings else "unknown"
+        tirith_key = f"tirith:{rule_id}"
+        if not is_approved(session_key, tirith_key):
+            warnings.append((tirith_key, _format_tirith_description(tirith_result), True))
+    if is_dangerous and not is_approved(session_key, pattern_key):
+        warnings.append((pattern_key, description, False))
+    if not warnings:
         return _approved()
+
+    combined_desc = "; ".join(desc for _, desc, _ in warnings)
+    primary_key = warnings[0][0]
+    all_keys = [key for key, _, _ in warnings]
+
+    # "Always" is offered when at least one warning is a dangerous-pattern key the persistence layer would actually
+    # allowlist permanently. Pure-tirith findings are session-max by design, so a tirith-only prompt hides Always;
+    # mixed prompts offer it (the pattern key persists, tirith downgrades to session — see _persist_choice).
     return _human_decision(
-        _COMMAND_GATE, command=command, description=description,
-        pattern_key=pattern_key, pattern_keys=[pattern_key],
+        _COMMAND_GATE, command=command, description=combined_desc,
+        pattern_key=primary_key, pattern_keys=all_keys,
         session_key=session_key, approval_callback=approval_callback,
         is_cli=is_cli, is_gateway=is_gateway, is_ask=is_ask, smart=approval_mode == "smart",
+        permanent_capable=any(not is_t for _, _, is_t in warnings),
     )
 
 
