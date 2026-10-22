@@ -1772,6 +1772,11 @@ DEFAULT_CONFIG = {
         # Answers inside these blocks are the proxy's sentinels, not internal hosts, so the guard
         # dials them instead of rejecting them as private. Empty = normal private-address verdict.
         "fake_ip_ranges": [],
+        # Compatibility bundle: retained independent scanner policy.
+        "tirith_enabled": True,
+        "tirith_path": "tirith",
+        "tirith_timeout": 5,
+        "tirith_fail_open": True,
         "redact_secrets": True,
         # Persisted acknowledgement for unattended model overrides whose tier lets the vendor train
         # on prompts. The startup guard still warns every run; cost guards are unaffected.

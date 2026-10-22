@@ -687,19 +687,9 @@ _RETIRED_TIRITH_KEYS = ("tirith_enabled", "tirith_path", "tirith_timeout", "tiri
 
 
 def _migrate_to_50(results: dict[str, Any], quiet: bool) -> None:
-    # 49 → 50: the bundled tirith scanner left Hermes. Nothing reads its keys now, so they are
-    # dropped; nothing replaces them.
-    config = read_raw_config()
-    security = config.get("security")
-    if not isinstance(security, dict):
-        return
-    present = [key for key in _RETIRED_TIRITH_KEYS if key in security]
-    if not present:
-        return
-    for key in present:
-        del security[key]
-    _commit(config, results, quiet, "removed security.tirith_* (scanner no longer bundled)",
-            "  ✓ Removed security.tirith_* — the tirith scanner is no longer bundled with Hermes.")
+    # Retained scanner: preserve policy, including stamp-independent reruns.
+    # migrate_config owns schema stamping; this step intentionally writes nothing.
+    return None
 
 
 MIGRATIONS: tuple[tuple[int, Callable[[dict[str, Any], bool], None]], ...] = (
