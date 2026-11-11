@@ -183,13 +183,13 @@ class TestInboundMedia:
         ad.handle_message = AsyncMock()
         return ad
 
-    def _event(self, msg_type, **message):
+    def _event(self, msg_type, source=None, **message):
         payload = {"type": msg_type, "id": f"{msg_type}-1"}
         payload.update(message)
         return {
             "type": "message",
             "replyToken": "reply-token",
-            "source": {"type": "group", "groupId": "Cline", "userId": "Uline"},
+            "source": source or {"type": "group", "groupId": "Cline", "userId": "Uline"},
             "message": payload,
         }
 
@@ -197,19 +197,49 @@ class TestInboundMedia:
         adapter.handle_message.assert_awaited_once()
         return adapter.handle_message.await_args.args[0]
 
+    _DM_SOURCE = {"type": "user", "userId": "Uline"}
+
     def test_image_message_uses_photo_type_and_image_mime(self, adapter):
+        # v0.22.1 preservation contract: group/room non-text is dropped by the
+        # mention gate before the reply token is stashed, so media dispatch is
+        # exercised through the DM path (which bypasses the group gate).
+        adapter._client.loading = AsyncMock()
         with patch.object(
             _line,
             "cache_image_from_bytes_async",
             new=AsyncMock(return_value="/cache/image.jpg"),
         ) as cache:
-            asyncio.run(adapter._handle_message_event(self._event("image")))
+            asyncio.run(adapter._handle_message_event(self._event("image", source=self._DM_SOURCE)))
 
         cache.assert_awaited_once_with(b"line-bytes", ext=".jpg")
         event = self._captured_event(adapter)
         assert event.message_type is _line.MessageType.PHOTO
         assert event.media_urls == ["/cache/image.jpg"]
         assert event.media_types == ["image/jpeg"]
+
+    def test_group_room_rejections_preserve_inflight_token(self, adapter):
+        # Seed an actual in-flight token; absence alone does not catch overwrites.
+        for kind, chat in [('group', 'Cline'), ('room', 'Rline')]:
+            source = {'type': kind, kind + 'Id': chat, 'userId': 'Uline'}
+            for message in [
+                {'type': media, 'mention': {'mentionees': [{'isSelf': True}]}}
+                for media in ['image', 'audio', 'video', 'file', 'sticker', 'location']
+            ] + [
+                {'type': 'text', 'text': text}
+                for text in ['hello', 'please @hermes answer', '@hermesbot hello']
+            ] + [
+                {'type': 'text', 'text': 'hello', 'mention': {'mentionees': [mention]}}
+                for mention in [{'isSelf': 1}, {'isSelf': 'true'}, {'type': 'user'}, None]
+            ]:
+                adapter._reply_tokens[chat] = ('original', 99)
+                with patch.object(_line, 'cache_image_from_bytes_async', new=AsyncMock()) as cache:
+                    event = self._event(message['type'], source=source)
+                    event['message'].update(message)
+                    asyncio.run(adapter._handle_message_event(event))
+                    cache.assert_not_awaited()
+                assert adapter._reply_tokens[chat] == ('original', 99)
+                adapter._client.fetch_content.assert_not_awaited()
+                adapter.handle_message.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------
@@ -326,6 +356,28 @@ class TestSlowLLMPostbackRegression:
         adapter._client.reply.assert_awaited_once()
         assert adapter._client.reply.await_args.args[1][0]["text"] == adapter.expired_text
         assert "Uchat" not in adapter._pending_buttons
+
+
+    def test_final_push_preserves_newer_mapping_on_both_outcomes(self, adapter):
+        from types import SimpleNamespace
+        for success in (True, False):
+            rid = adapter._cache.register_pending('Uchat')
+            newer = adapter._cache.register_pending('Uchat')
+            adapter._pending_buttons['Uchat'] = rid
+
+            async def push(chat, content, *, force_push):
+                assert force_push is True
+                assert adapter._cache.get(rid).state is State.READY
+                assert adapter._cache.get(rid).payload == content == 'final'
+                adapter._pending_buttons[chat] = newer
+                return SimpleNamespace(success=success)
+
+            with patch.object(adapter, '_send_text_chunks', new=AsyncMock(side_effect=push)) as transport:
+                result = asyncio.run(adapter.send('Uchat', 'final'))
+                transport.assert_awaited_once_with('Uchat', 'final', force_push=True)
+            assert result.success and result.message_id == rid
+            assert adapter._pending_buttons['Uchat'] == newer
+            assert adapter._cache.get(rid).state is (State.DELIVERED if success else State.READY)
 
 
 class TestEnvEnablement:
